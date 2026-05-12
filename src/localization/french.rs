@@ -40,6 +40,7 @@ pub(super) const STRINGS: Strings = Strings {
     token_expired_title: "Erreur d'authentification",
     token_expired_body: "Exécutez 'claude' dans un terminal, puis utilisez '/login' et suivez les instructions. Ensuite, actualisez ou redémarrez cette application.",
     show_pacing: "Afficher la progression",
+    lock_codex_window: "Verrouiller fenêtre Codex 5h",
     codex_token_expired_title: "Erreur d'authentification Codex",
     codex_token_expired_body: "Executez 'codex' dans un terminal et suivez les instructions de connexion. Ensuite, actualisez ou redemarrez cette application.",
     codex_window_title: "Moniteur d'utilisation Codex",

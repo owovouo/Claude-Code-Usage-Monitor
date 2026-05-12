@@ -1,0 +1,11 @@
+執行（開發模式）
+cargo run
+
+或加上診斷模式（輸出 log 檔）：
+cargo run -- --diagnose
+
+打包（發佈版本）
+cargo build --release
+
+完成後 exe 在：
+target\release\claude-code-usage-monitor.exe

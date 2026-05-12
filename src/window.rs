@@ -92,6 +92,7 @@ struct AppState {
     quiet_hours_end: Option<(u8, u8)>,
 
     show_pacing: bool,
+    lock_codex_window: bool,
     session_pacing_pct: Option<f64>,
     weekly_pacing_pct: Option<f64>,
     session_resets_at: Option<std::time::SystemTime>,
@@ -141,6 +142,7 @@ const IDM_MODEL_CODEX: u16 = 61;
 const IDM_QUIET_SET_TIME: u16 = 62;
 const IDM_QUIET_CLEAR: u16 = 63;
 const IDM_TOGGLE_PACING: u16 = 64;
+const IDM_TOGGLE_CODEX_LOCK: u16 = 65;
 
 // Dialog control IDs
 const IDC_QUIET_START_EDIT: i32 = 201;
@@ -242,6 +244,8 @@ struct SettingsFile {
     quiet_time_end: Option<String>,
     #[serde(default)]
     show_pacing: bool,
+    #[serde(default)]
+    lock_codex_window: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
@@ -259,6 +263,7 @@ impl Default for SettingsFile {
             quiet_time_start: None,
             quiet_time_end: None,
             show_pacing: false,
+            lock_codex_window: false,
             show_claude_code: true,
             show_codex: false,
         }
@@ -317,6 +322,7 @@ fn save_state_settings() {
             quiet_time_start: s.quiet_hours_start.map(|(h, m)| format!("{:02}:{:02}", h, m)),
             quiet_time_end: s.quiet_hours_end.map(|(h, m)| format!("{:02}:{:02}", h, m)),
             show_pacing: s.show_pacing,
+            lock_codex_window: s.lock_codex_window,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
         });
@@ -1537,6 +1543,7 @@ pub fn run() {
                 quiet_hours_start: settings.quiet_time_start.as_deref().and_then(parse_hhmm),
                 quiet_hours_end: settings.quiet_time_end.as_deref().and_then(parse_hhmm),
                 show_pacing: settings.show_pacing,
+                lock_codex_window: settings.lock_codex_window,
                 session_pacing_pct: None,
                 weekly_pacing_pct: None,
                 session_resets_at: None,
@@ -2080,8 +2087,17 @@ fn do_poll(send_hwnd: SendHwnd) {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex, !quiet_now(s)))
-            .unwrap_or((true, false, true))
+            .map(|s| {
+                (
+                    s.show_claude_code,
+                    s.show_codex,
+                    // Trigger gated by both the user setting and Idle Hours:
+                    // requires opt-in via Settings → Lock Codex 5h Window,
+                    // and is suppressed entirely during Idle Hours.
+                    s.lock_codex_window && !quiet_now(s),
+                )
+            })
+            .unwrap_or((true, false, false))
     };
 
     match poller::poll(show_claude_code, show_codex, allow_codex_trigger) {
@@ -3019,6 +3035,23 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     schedule_quiet_boundary_timer(hwnd);
                 }
+                IDM_TOGGLE_CODEX_LOCK => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.lock_codex_window = !s.lock_codex_window;
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                    // Spawn an immediate poll so a newly-enabled lock can take
+                    // effect right away (the trigger fires on the next poll,
+                    // which would otherwise be up to 15 min away).
+                    let sh = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || {
+                        do_poll(sh);
+                    });
+                }
                 IDM_TOGGLE_PACING => {
                     {
                         let mut state = lock_state();
@@ -3096,6 +3129,7 @@ fn show_context_menu(hwnd: HWND) {
             quiet_hours_start,
             quiet_hours_end,
             show_pacing,
+            lock_codex_window,
             show_claude_code,
             show_codex,
         ) = {
@@ -3112,6 +3146,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.quiet_hours_start,
                     s.quiet_hours_end,
                     s.show_pacing,
+                    s.lock_codex_window,
                     s.show_claude_code,
                     s.show_codex,
                 ),
@@ -3125,6 +3160,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     None::<(u8, u8)>,
                     None::<(u8, u8)>,
+                    false,
                     false,
                     true,
                     false,
@@ -3294,6 +3330,19 @@ fn show_context_menu(hwnd: HWND) {
             pacing_flags,
             IDM_TOGGLE_PACING as usize,
             PCWSTR::from_raw(pacing_str.as_ptr()),
+        );
+
+        let codex_lock_str = native_interop::wide_str(strings.lock_codex_window);
+        let codex_lock_flags = if lock_codex_window {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            codex_lock_flags,
+            IDM_TOGGLE_CODEX_LOCK as usize,
+            PCWSTR::from_raw(codex_lock_str.as_ptr()),
         );
 
         let language_menu = CreatePopupMenu().unwrap();
