@@ -2076,15 +2076,15 @@ fn compute_pacing_pct(resets_at: Option<std::time::SystemTime>, window_secs: f64
 
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    let (show_claude_code, show_codex) = {
+    let (show_claude_code, show_codex, allow_codex_trigger) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex))
-            .unwrap_or((true, false))
+            .map(|s| (s.show_claude_code, s.show_codex, !quiet_now(s)))
+            .unwrap_or((true, false, true))
     };
 
-    match poller::poll(show_claude_code, show_codex) {
+    match poller::poll(show_claude_code, show_codex, allow_codex_trigger) {
         Ok(data) => {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {

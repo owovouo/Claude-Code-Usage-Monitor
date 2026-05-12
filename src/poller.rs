@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
@@ -8,6 +9,22 @@ use std::os::windows::process::CommandExt;
 use crate::diagnose;
 use crate::localization::Strings;
 use crate::models::{AppUsageData, UsageData, UsageSection};
+
+/// Codex's `/wham/usage` endpoint returns a "sliding" window — `reset_at` is
+/// always ~5h from now — until the user makes an actual API call. To give the
+/// user a fixed, plannable reset time, we run `codex exec .` once to lock the
+/// 5h window. These statics track when we last locked and the previously
+/// observed `reset_at`, so we can detect sliding behavior across polls.
+static CODEX_PREVIOUS_RESET_AT: Mutex<Option<SystemTime>> = Mutex::new(None);
+static CODEX_LAST_TRIGGER_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Treat `reset_at` advancing by more than this between polls as evidence the
+/// window is sliding (or has just rolled over). Both cases warrant a re-lock.
+const CODEX_SLIDING_TOLERANCE: Duration = Duration::from_secs(60);
+
+/// Minimum time between two Codex triggers. Slightly less than the 5h window
+/// length so a fresh trigger can fire shortly after each natural rollover.
+const CODEX_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -72,7 +89,11 @@ struct CodexRateLimitWindow {
     reset_at: i64,
 }
 
-pub fn poll(show_claude_code: bool, show_codex: bool) -> Result<AppUsageData, PollError> {
+pub fn poll(
+    show_claude_code: bool,
+    show_codex: bool,
+    allow_codex_trigger: bool,
+) -> Result<AppUsageData, PollError> {
     let mut data = AppUsageData::default();
 
     if show_claude_code {
@@ -80,7 +101,7 @@ pub fn poll(show_claude_code: bool, show_codex: bool) -> Result<AppUsageData, Po
     }
 
     if show_codex {
-        match poll_codex() {
+        match poll_codex(allow_codex_trigger) {
             Ok(codex) => data.codex = Some(codex),
             Err(error) if !show_claude_code => return Err(error),
             Err(error) => diagnose::log(format!("Codex usage poll failed: {error:?}")),
@@ -108,7 +129,7 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
     fetch_usage_with_fallback(&creds.access_token)
 }
 
-fn poll_codex() -> Result<UsageData, PollError> {
+fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
     let creds = match read_codex_credentials() {
         Some(creds) => creds,
         None => {
@@ -117,15 +138,63 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
     };
 
-    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
-        Ok(data) => Ok(data),
+    let mut data = match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
+        Ok(data) => data,
         Err(PollError::AuthRequired) => {
             cli_refresh_codex_token();
+            // The refresh subprocess (`codex exec .`) also locks a fresh 5h
+            // window, so record it as a trigger for cooldown purposes.
+            *CODEX_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
             let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())?
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
+    };
+
+    // Decide whether to lock a window. Three trigger conditions, gated by cooldown
+    // (so a stuck/failed trigger can't loop) and the caller's `allow_trigger`
+    // (which is false during Idle Hours).
+    //
+    //   1. `resets_at` is None              → API reports no window at all
+    //   2. `percentage <= 0.0`              → window present but empty; likely
+    //                                         a sliding fake or a just-rolled
+    //                                         window with no usage yet
+    //   3. `reset_at` advanced > tolerance  → cross-poll evidence of sliding
+    //                                         even with non-zero percentage
+    if allow_trigger {
+        let previous = *CODEX_PREVIOUS_RESET_AT.lock().unwrap();
+        let current = data.session.resets_at;
+
+        let no_real_window = current.is_none() || data.session.percentage <= 0.0;
+        let is_sliding = match (previous, current) {
+            (Some(prev), Some(curr)) => curr
+                .duration_since(prev)
+                .map(|d| d > CODEX_SLIDING_TOLERANCE)
+                .unwrap_or(false),
+            _ => false,
+        };
+
+        let cooldown_passed = CODEX_LAST_TRIGGER_AT
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed() > CODEX_TRIGGER_COOLDOWN)
+            .unwrap_or(true);
+
+        if (no_real_window || is_sliding) && cooldown_passed {
+            diagnose::log(format!(
+                "Codex window not locked (no_window={no_real_window} sliding={is_sliding}); running `codex exec .`"
+            ));
+            *CODEX_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
+            cli_refresh_codex_token();
+            data = fetch_codex_usage(&creds.access_token, creds.account_id.as_deref())?;
+        }
     }
+
+    // Always record the reset_at we just observed so the next poll can detect
+    // sliding behavior.
+    *CODEX_PREVIOUS_RESET_AT.lock().unwrap() = data.session.resets_at;
+
+    Ok(data)
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
@@ -669,12 +738,21 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         }
     };
 
-    codex_usage_from_response(response).ok_or(PollError::RequestFailed)
+    Ok(codex_usage_from_response(response))
 }
 
-fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
-    let details = *response.rate_limit.flatten()?;
+/// Parse a `/wham/usage` response into our internal `UsageData` shape.
+///
+/// Returns an empty `UsageData` (0%, no `resets_at`) when the response has no
+/// `rate_limit` or `primary_window` — i.e. there's no active 5h window. This
+/// is distinct from a network/parse error so the caller can react accordingly
+/// (e.g. attempt a one-shot `codex exec .` to start a window).
+fn codex_usage_from_response(response: CodexUsageResponse) -> UsageData {
     let mut data = UsageData::default();
+    let Some(details_box) = response.rate_limit.flatten() else {
+        return data;
+    };
+    let details = *details_box;
 
     if let Some(window) = details.primary_window.flatten() {
         data.session = codex_section_from_window(&window);
@@ -684,7 +762,7 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
         data.weekly = codex_section_from_window(&window);
     }
 
-    Some(data)
+    data
 }
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
