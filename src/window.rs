@@ -1724,9 +1724,20 @@ fn render_layered() {
                 } else {
                     s.weekly_pacing_pct.filter(|&p| p > s.weekly_percent)
                 };
-                // Codex shows available (remaining) quota in green rather than a pacing indicator
-                let codex_session_pacing = Some(100.0_f64);
-                let codex_weekly_pacing = Some(100.0_f64);
+                // Codex shows available (remaining) quota in green rather than a pacing indicator.
+                // Suppress when: quiet-hours reset done (eff_pct would be 0 while text still
+                // shows the pre-reset value), or Codex data not yet fetched (resets_at = None,
+                // meaning percent is 0 and showing green from 0–100% would hide all dark track).
+                let codex_session_pacing = if codex_session_reset_done || s.codex_session_resets_at.is_none() {
+                    None
+                } else {
+                    Some(100.0_f64)
+                };
+                let codex_weekly_pacing = if codex_weekly_reset_done || s.codex_weekly_resets_at.is_none() {
+                    None
+                } else {
+                    Some(100.0_f64)
+                };
                 (
                     s.hwnd,
                     s.is_dark,
@@ -3448,9 +3459,20 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 } else {
                     s.weekly_pacing_pct.filter(|&p| p > s.weekly_percent)
                 };
-                // Codex shows available (remaining) quota in green rather than a pacing indicator
-                let codex_session_pacing = Some(100.0_f64);
-                let codex_weekly_pacing = Some(100.0_f64);
+                // Codex shows available (remaining) quota in green rather than a pacing indicator.
+                // Suppress when: quiet-hours reset done (eff_pct would be 0 while text still
+                // shows the pre-reset value), or Codex data not yet fetched (resets_at = None,
+                // meaning percent is 0 and showing green from 0–100% would hide all dark track).
+                let codex_session_pacing = if codex_session_reset_done || s.codex_session_resets_at.is_none() {
+                    None
+                } else {
+                    Some(100.0_f64)
+                };
+                let codex_weekly_pacing = if codex_weekly_reset_done || s.codex_weekly_resets_at.is_none() {
+                    None
+                } else {
+                    Some(100.0_f64)
+                };
                 (
                     s.is_dark,
                     s.language.strings(),
