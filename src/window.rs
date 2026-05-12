@@ -1724,26 +1724,9 @@ fn render_layered() {
                 } else {
                     s.weekly_pacing_pct.filter(|&p| p > s.weekly_percent)
                 };
-                let codex_session_pacing = if quiet {
-                    if !codex_session_reset_done && s.show_pacing {
-                        compute_pacing_pct(s.codex_session_resets_at, 5.0 * 3600.0)
-                            .filter(|&p| p > eff_codex_session_pct)
-                    } else {
-                        None
-                    }
-                } else {
-                    s.codex_session_pacing_pct.filter(|&p| p > s.codex_session_percent)
-                };
-                let codex_weekly_pacing = if quiet {
-                    if !codex_weekly_reset_done && s.show_pacing {
-                        compute_pacing_pct(s.codex_weekly_resets_at, 7.0 * 24.0 * 3600.0)
-                            .filter(|&p| p > eff_codex_weekly_pct)
-                    } else {
-                        None
-                    }
-                } else {
-                    s.codex_weekly_pacing_pct.filter(|&p| p > s.codex_weekly_percent)
-                };
+                // Codex shows available (remaining) quota in green rather than a pacing indicator
+                let codex_session_pacing = Some(100.0_f64);
+                let codex_weekly_pacing = Some(100.0_f64);
                 (
                     s.hwnd,
                     s.is_dark,
@@ -3465,26 +3448,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 } else {
                     s.weekly_pacing_pct.filter(|&p| p > s.weekly_percent)
                 };
-                let codex_session_pacing = if quiet {
-                    if !codex_session_reset_done && s.show_pacing {
-                        compute_pacing_pct(s.codex_session_resets_at, 5.0 * 3600.0)
-                            .filter(|&p| p > eff_codex_session_pct)
-                    } else {
-                        None
-                    }
-                } else {
-                    s.codex_session_pacing_pct.filter(|&p| p > s.codex_session_percent)
-                };
-                let codex_weekly_pacing = if quiet {
-                    if !codex_weekly_reset_done && s.show_pacing {
-                        compute_pacing_pct(s.codex_weekly_resets_at, 7.0 * 24.0 * 3600.0)
-                            .filter(|&p| p > eff_codex_weekly_pct)
-                    } else {
-                        None
-                    }
-                } else {
-                    s.codex_weekly_pacing_pct.filter(|&p| p > s.codex_weekly_percent)
-                };
+                // Codex shows available (remaining) quota in green rather than a pacing indicator
+                let codex_session_pacing = Some(100.0_f64);
+                let codex_weekly_pacing = Some(100.0_f64);
                 (
                     s.is_dark,
                     s.language.strings(),
