@@ -40,7 +40,7 @@ pub(super) const STRINGS: Strings = Strings {
     token_expired_title: "驗證錯誤",
     token_expired_body: "請在終端機中執行 'claude'，然後使用 '/login' 並依照提示操作。完成後，請重新整理或重新啟動此應用程式。",
     show_pacing: "顯示配額進度",
-    lock_codex_window: "鎖定 Codex 5h 視窗",
+    lock_codex_window: "強制 Codex 5h 即時倒數",
     codex_token_expired_title: "Codex 驗證錯誤",
     codex_token_expired_body: "請在終端機中執行 'codex'，並依照登入提示操作。完成後，請重新整理或重新啟動此應用程式。",
     codex_window_title: "Codex 使用量監控",
