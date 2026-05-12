@@ -1724,19 +1724,25 @@ fn render_layered() {
                 } else {
                     s.weekly_pacing_pct.filter(|&p| p > s.weekly_percent)
                 };
-                // Codex shows available (remaining) quota in green rather than a pacing indicator.
-                // Suppress when: quiet-hours reset done (eff_pct would be 0 while text still
-                // shows the pre-reset value), or Codex data not yet fetched (resets_at = None,
-                // meaning percent is 0 and showing green from 0–100% would hide all dark track).
-                let codex_session_pacing = if codex_session_reset_done || s.codex_session_resets_at.is_none() {
-                    None
+                let codex_session_pacing = if quiet {
+                    if !codex_session_reset_done && s.show_pacing {
+                        compute_pacing_pct(s.codex_session_resets_at, 5.0 * 3600.0)
+                            .filter(|&p| p > eff_codex_session_pct)
+                    } else {
+                        None
+                    }
                 } else {
-                    Some(100.0_f64)
+                    s.codex_session_pacing_pct.filter(|&p| p > s.codex_session_percent)
                 };
-                let codex_weekly_pacing = if codex_weekly_reset_done || s.codex_weekly_resets_at.is_none() {
-                    None
+                let codex_weekly_pacing = if quiet {
+                    if !codex_weekly_reset_done && s.show_pacing {
+                        compute_pacing_pct(s.codex_weekly_resets_at, 7.0 * 24.0 * 3600.0)
+                            .filter(|&p| p > eff_codex_weekly_pct)
+                    } else {
+                        None
+                    }
                 } else {
-                    Some(100.0_f64)
+                    s.codex_weekly_pacing_pct.filter(|&p| p > s.codex_weekly_percent)
                 };
                 (
                     s.hwnd,
@@ -3459,19 +3465,25 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 } else {
                     s.weekly_pacing_pct.filter(|&p| p > s.weekly_percent)
                 };
-                // Codex shows available (remaining) quota in green rather than a pacing indicator.
-                // Suppress when: quiet-hours reset done (eff_pct would be 0 while text still
-                // shows the pre-reset value), or Codex data not yet fetched (resets_at = None,
-                // meaning percent is 0 and showing green from 0–100% would hide all dark track).
-                let codex_session_pacing = if codex_session_reset_done || s.codex_session_resets_at.is_none() {
-                    None
+                let codex_session_pacing = if quiet {
+                    if !codex_session_reset_done && s.show_pacing {
+                        compute_pacing_pct(s.codex_session_resets_at, 5.0 * 3600.0)
+                            .filter(|&p| p > eff_codex_session_pct)
+                    } else {
+                        None
+                    }
                 } else {
-                    Some(100.0_f64)
+                    s.codex_session_pacing_pct.filter(|&p| p > s.codex_session_percent)
                 };
-                let codex_weekly_pacing = if codex_weekly_reset_done || s.codex_weekly_resets_at.is_none() {
-                    None
+                let codex_weekly_pacing = if quiet {
+                    if !codex_weekly_reset_done && s.show_pacing {
+                        compute_pacing_pct(s.codex_weekly_resets_at, 7.0 * 24.0 * 3600.0)
+                            .filter(|&p| p > eff_codex_weekly_pct)
+                    } else {
+                        None
+                    }
                 } else {
-                    Some(100.0_f64)
+                    s.codex_weekly_pacing_pct.filter(|&p| p > s.codex_weekly_percent)
                 };
                 (
                     s.is_dark,
