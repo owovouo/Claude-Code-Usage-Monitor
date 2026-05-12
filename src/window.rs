@@ -2603,6 +2603,27 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_QUIET_BOUNDARY => {
                     render_layered();
                     schedule_quiet_boundary_timer(hwnd);
+                    // When Idle Hours just ended, fire an immediate poll so
+                    // the Codex window can lock at the boundary minute (e.g.
+                    // 08:05) rather than at whatever moment the regular
+                    // TIMER_POLL happens to next align with. Also restart
+                    // TIMER_POLL so subsequent polls land at boundary + N min
+                    // intervals instead of the original schedule.
+                    if !is_quiet_time() {
+                        let interval_ms = {
+                            let state = lock_state();
+                            state
+                                .as_ref()
+                                .map(|s| s.poll_interval_ms)
+                                .unwrap_or(POLL_15_MIN)
+                        };
+                        let _ = KillTimer(hwnd, TIMER_POLL);
+                        SetTimer(hwnd, TIMER_POLL, interval_ms, None);
+                        let sh = SendHwnd::from_hwnd(hwnd);
+                        std::thread::spawn(move || {
+                            do_poll(sh);
+                        });
+                    }
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
