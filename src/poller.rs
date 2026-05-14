@@ -211,7 +211,10 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
             ));
             *CODEX_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
             cli_refresh_codex_token();
-            data = fetch_codex_usage(&creds.access_token, creds.account_id.as_deref())?;
+            // Re-read credentials after the lock call in case the subprocess
+            // refreshed the auth token; fall back to the original if unavailable.
+            let lock_creds = read_codex_credentials().unwrap_or(creds);
+            data = fetch_codex_usage(&lock_creds.access_token, lock_creds.account_id.as_deref())?;
         }
     }
 

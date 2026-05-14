@@ -1369,6 +1369,10 @@ fn total_widget_width_for(active_models: i32) -> i32 {
         + sc(RIGHT_MARGIN)
 }
 
+fn total_widget_width_for_state(state: &AppState) -> i32 {
+    total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex))
+}
+
 fn total_widget_width() -> i32 {
     let active_models = {
         let state = lock_state();
@@ -2287,8 +2291,10 @@ fn schedule_countdown_timer() {
         None => return,
     };
 
-    // If a reset time has passed, poll every 5s to pick up fresh data
-    if poller::app_is_past_reset(data) {
+    // If a reset time has passed, poll every 5s to pick up fresh data.
+    // Skip during Idle Hours — TIMER_RESET_POLL's handler would suppress the
+    // poll anyway, so spinning it every 5s is wasteful.
+    if poller::app_is_past_reset(data) && !quiet_now(s) {
         unsafe {
             SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
         }
@@ -2760,12 +2766,8 @@ unsafe extern "system" fn wnd_proc(
                                     tray_left = tray_rect.left;
                                 }
                             }
-                            // Use _for() variant to avoid re-acquiring the state lock
-                            // while we already hold it (total_widget_width calls lock_state).
-                            let widget_width = total_widget_width_for(
-                                active_model_count(s.show_claude_code, s.show_codex),
-                            );
-                            let max_offset = tray_left - taskbar_rect.left - widget_width;
+                            let widget_width = total_widget_width_for_state(s);
+                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
                             if new_offset > max_offset {
                                 new_offset = max_offset;
                             }
