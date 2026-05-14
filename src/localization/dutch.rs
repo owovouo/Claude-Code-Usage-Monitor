@@ -45,6 +45,7 @@ pub(super) const STRINGS: Strings = Strings {
     second_suffix: "s",
     show_pacing: "Pacingindicator tonen",
     lock_codex_window: "Codex 5h-aftelling forceren",
+    lock_claude_code_window: "Claude Code 5h-aftelling forceren",
     quiet_hours: "Inactieve uren",
     quiet_start: "Begin",
     quiet_end: "Einde",

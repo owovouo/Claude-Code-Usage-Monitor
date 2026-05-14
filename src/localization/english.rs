@@ -41,6 +41,7 @@ pub(super) const STRINGS: Strings = Strings {
     token_expired_body: "Run 'claude' in a terminal, then use '/login' and follow the prompts. After that, refresh or restart this app.",
     show_pacing: "Show Pacing Indicator",
     lock_codex_window: "Force Codex 5h Live Countdown",
+    lock_claude_code_window: "Force Claude Code 5h Live Countdown",
     codex_token_expired_title: "Codex Auth Error",
     codex_token_expired_body: "Run 'codex' in a terminal and follow the sign-in prompts. After that, refresh or restart this app.",
     codex_window_title: "Codex Usage Monitor",

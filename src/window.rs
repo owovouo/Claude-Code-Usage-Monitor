@@ -93,6 +93,7 @@ struct AppState {
 
     show_pacing: bool,
     lock_codex_window: bool,
+    lock_claude_code_window: bool,
     session_pacing_pct: Option<f64>,
     weekly_pacing_pct: Option<f64>,
     session_resets_at: Option<std::time::SystemTime>,
@@ -143,6 +144,7 @@ const IDM_QUIET_SET_TIME: u16 = 62;
 const IDM_QUIET_CLEAR: u16 = 63;
 const IDM_TOGGLE_PACING: u16 = 64;
 const IDM_TOGGLE_CODEX_LOCK: u16 = 65;
+const IDM_TOGGLE_CLAUDE_LOCK: u16 = 66;
 
 // Dialog control IDs
 const IDC_QUIET_START_EDIT: i32 = 201;
@@ -246,6 +248,8 @@ struct SettingsFile {
     show_pacing: bool,
     #[serde(default)]
     lock_codex_window: bool,
+    #[serde(default)]
+    lock_claude_code_window: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
@@ -264,6 +268,7 @@ impl Default for SettingsFile {
             quiet_time_end: None,
             show_pacing: false,
             lock_codex_window: false,
+            lock_claude_code_window: false,
             show_claude_code: true,
             show_codex: false,
         }
@@ -323,6 +328,7 @@ fn save_state_settings() {
             quiet_time_end: s.quiet_hours_end.map(|(h, m)| format!("{:02}:{:02}", h, m)),
             show_pacing: s.show_pacing,
             lock_codex_window: s.lock_codex_window,
+            lock_claude_code_window: s.lock_claude_code_window,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
         });
@@ -1544,6 +1550,7 @@ pub fn run() {
                 quiet_hours_end: settings.quiet_time_end.as_deref().and_then(parse_hhmm),
                 show_pacing: settings.show_pacing,
                 lock_codex_window: settings.lock_codex_window,
+                lock_claude_code_window: settings.lock_claude_code_window,
                 session_pacing_pct: None,
                 weekly_pacing_pct: None,
                 session_resets_at: None,
@@ -2083,24 +2090,26 @@ fn compute_pacing_pct(resets_at: Option<std::time::SystemTime>, window_secs: f64
 
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    let (show_claude_code, show_codex, allow_codex_trigger) = {
+    let (show_claude_code, show_codex, allow_codex_trigger, allow_claude_trigger) = {
         let state = lock_state();
         state
             .as_ref()
             .map(|s| {
+                let not_quiet = !quiet_now(s);
                 (
                     s.show_claude_code,
                     s.show_codex,
                     // Trigger gated by both the user setting and Idle Hours:
                     // requires opt-in via Settings → Lock Codex 5h Window,
                     // and is suppressed entirely during Idle Hours.
-                    s.lock_codex_window && !quiet_now(s),
+                    s.lock_codex_window && not_quiet,
+                    s.lock_claude_code_window && not_quiet,
                 )
             })
-            .unwrap_or((true, false, false))
+            .unwrap_or((true, false, false, false))
     };
 
-    match poller::poll(show_claude_code, show_codex, allow_codex_trigger) {
+    match poller::poll(show_claude_code, show_codex, allow_codex_trigger, allow_claude_trigger) {
         Ok(data) => {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
@@ -3056,6 +3065,23 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     schedule_quiet_boundary_timer(hwnd);
                 }
+                IDM_TOGGLE_CLAUDE_LOCK => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.lock_claude_code_window = !s.lock_claude_code_window;
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                    // Spawn an immediate poll so a newly-enabled lock can take
+                    // effect right away (the trigger fires on the next poll,
+                    // which would otherwise be up to 15 min away).
+                    let sh = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || {
+                        do_poll(sh);
+                    });
+                }
                 IDM_TOGGLE_CODEX_LOCK => {
                     {
                         let mut state = lock_state();
@@ -3151,6 +3177,7 @@ fn show_context_menu(hwnd: HWND) {
             quiet_hours_end,
             show_pacing,
             lock_codex_window,
+            lock_claude_code_window,
             show_claude_code,
             show_codex,
         ) = {
@@ -3168,6 +3195,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.quiet_hours_end,
                     s.show_pacing,
                     s.lock_codex_window,
+                    s.lock_claude_code_window,
                     s.show_claude_code,
                     s.show_codex,
                 ),
@@ -3181,6 +3209,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     None::<(u8, u8)>,
                     None::<(u8, u8)>,
+                    false,
                     false,
                     false,
                     true,
@@ -3351,6 +3380,19 @@ fn show_context_menu(hwnd: HWND) {
             pacing_flags,
             IDM_TOGGLE_PACING as usize,
             PCWSTR::from_raw(pacing_str.as_ptr()),
+        );
+
+        let claude_lock_str = native_interop::wide_str(strings.lock_claude_code_window);
+        let claude_lock_flags = if lock_claude_code_window {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            claude_lock_flags,
+            IDM_TOGGLE_CLAUDE_LOCK as usize,
+            PCWSTR::from_raw(claude_lock_str.as_ptr()),
         );
 
         let codex_lock_str = native_interop::wide_str(strings.lock_codex_window);

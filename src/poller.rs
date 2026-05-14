@@ -26,6 +26,9 @@ const CODEX_SLIDING_TOLERANCE: Duration = Duration::from_secs(60);
 /// length so a fresh trigger can fire shortly after each natural rollover.
 const CODEX_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
 
+static CLAUDE_CODE_LAST_TRIGGER_AT: Mutex<Option<Instant>> = Mutex::new(None);
+const CLAUDE_CODE_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
+
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -93,11 +96,12 @@ pub fn poll(
     show_claude_code: bool,
     show_codex: bool,
     allow_codex_trigger: bool,
+    allow_claude_trigger: bool,
 ) -> Result<AppUsageData, PollError> {
     let mut data = AppUsageData::default();
 
     if show_claude_code {
-        data.claude_code = Some(poll_claude_code()?);
+        data.claude_code = Some(poll_claude_code(allow_claude_trigger)?);
     }
 
     if show_codex {
@@ -115,7 +119,7 @@ pub fn poll(
     }
 }
 
-fn poll_claude_code() -> Result<UsageData, PollError> {
+fn poll_claude_code(allow_trigger: bool) -> Result<UsageData, PollError> {
     let creds = match read_first_credentials() {
         Some(c) => c,
         None => {
@@ -125,8 +129,29 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
     };
 
     let creds = refresh_or_fallback(creds)?;
+    let data = fetch_usage_with_fallback(&creds.access_token)?;
 
-    fetch_usage_with_fallback(&creds.access_token)
+    if allow_trigger {
+        let no_real_window = data.session.resets_at.is_none() || data.session.percentage <= 0.0;
+        let cooldown_passed = CLAUDE_CODE_LAST_TRIGGER_AT
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed() > CLAUDE_CODE_TRIGGER_COOLDOWN)
+            .unwrap_or(true);
+
+        if no_real_window && cooldown_passed {
+            diagnose::log(format!(
+                "Claude Code window empty (no_window={}); locking via API call",
+                data.session.resets_at.is_none()
+            ));
+            *CLAUDE_CODE_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
+            if let Ok(locked) = fetch_usage_via_messages(&creds.access_token) {
+                return Ok(locked);
+            }
+        }
+    }
+
+    Ok(data)
 }
 
 fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {

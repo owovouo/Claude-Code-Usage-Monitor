@@ -162,6 +162,7 @@ pub struct Strings {
     pub token_expired_body: &'static str,
     pub show_pacing: &'static str,
     pub lock_codex_window: &'static str,
+    pub lock_claude_code_window: &'static str,
     pub quiet_hours: &'static str,
     pub quiet_start: &'static str,
     pub quiet_end: &'static str,
