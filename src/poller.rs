@@ -207,7 +207,8 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
 
         if (no_real_window || is_sliding) && cooldown_passed {
             diagnose::log(format!(
-                "Codex window not locked (no_window={no_real_window} sliding={is_sliding}); running `codex exec .`"
+                "Codex window not locked (no_window={no_real_window} sliding={is_sliding} pct={:.2} prev={previous:?} curr={current:?}); running `codex exec .`",
+                data.session.percentage
             ));
             *CODEX_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
             cli_refresh_codex_token();
@@ -215,6 +216,10 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
             // refreshed the auth token; fall back to the original if unavailable.
             let lock_creds = read_codex_credentials().unwrap_or(creds);
             data = fetch_codex_usage(&lock_creds.access_token, lock_creds.account_id.as_deref())?;
+            diagnose::log(format!(
+                "Codex post-trigger usage: pct={:.2} resets_at={:?}",
+                data.session.percentage, data.session.resets_at
+            ));
         }
     }
 
@@ -372,6 +377,7 @@ fn cli_refresh_codex_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    let started = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -380,7 +386,11 @@ fn cli_refresh_codex_token() {
         }
     };
 
-    wait_for_refresh(&mut child);
+    let outcome = wait_for_refresh(&mut child);
+    diagnose::log(format!(
+        "codex exec . finished: {outcome:?} after {:?}",
+        started.elapsed()
+    ));
 }
 
 /// Spawn a command and wait up to `timeout` for it to finish.
@@ -404,20 +414,28 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
     }
 }
 
-fn wait_for_refresh(child: &mut std::process::Child) {
+#[derive(Debug)]
+#[allow(dead_code)]
+enum RefreshOutcome {
+    Exited(Option<i32>),
+    KilledByTimeout,
+    WaitFailed,
+}
+
+fn wait_for_refresh(child: &mut std::process::Child) -> RefreshOutcome {
     // Wait up to 30 seconds; don't block the poll thread forever.
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => return RefreshOutcome::Exited(status.code()),
             Ok(None) => {
                 if start.elapsed() > Duration::from_secs(30) {
                     let _ = child.kill();
-                    break;
+                    return RefreshOutcome::KilledByTimeout;
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            Err(_) => break,
+            Err(_) => return RefreshOutcome::WaitFailed,
         }
     }
 }
