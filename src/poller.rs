@@ -392,22 +392,31 @@ fn cli_refresh_codex_token() {
     };
     cmd.creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
     let started = Instant::now();
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
+    let output = match run_with_timeout(&mut cmd, Duration::from_secs(30)) {
+        Some(output) => output,
+        None => {
+            diagnose::log(format!(
+                "codex exec . timed out or failed to spawn after {:?}",
+                started.elapsed()
+            ));
             return;
         }
     };
 
-    let outcome = wait_for_refresh(&mut child);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     diagnose::log(format!(
-        "codex exec . finished: {outcome:?} after {:?}",
-        started.elapsed()
+        "codex exec . finished: status={:?} after {:?}\n--- stdout ({} bytes) ---\n{}\n--- stderr ({} bytes) ---\n{}\n--- end ---",
+        output.status.code(),
+        started.elapsed(),
+        output.stdout.len(),
+        stdout.trim_end(),
+        output.stderr.len(),
+        stderr.trim_end()
     ));
 }
 
