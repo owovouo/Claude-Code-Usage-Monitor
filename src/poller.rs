@@ -370,10 +370,21 @@ fn cli_refresh_codex_token() {
         "attempting Windows Codex token refresh via {codex_path}"
     ));
 
-    // `--skip-git-repo-check` is required when running outside a trusted git
-    // repo — otherwise the CLI refuses with "Not inside a trusted directory".
-    // Our subprocess inherits this app's cwd, which is rarely a git repo.
-    let args: &[&str] = &["exec", "--skip-git-repo-check", "."];
+    // Locking the Codex 5h window requires hitting the rate-limited chat
+    // endpoint — `codex login status` is too lightweight. We run a tightly
+    // bounded model task: read-only sandbox (no shell), no user config or
+    // rule files loaded, no session persistence, minimal "ok" prompt.
+    // Cost: ~10-30 tokens per lock. Runtime: typically 3-15s.
+    let args: &[&str] = &[
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "-s",
+        "read-only",
+        "ok",
+    ];
 
     let mut cmd = if is_cmd {
         let mut c = Command::new("cmd.exe");
@@ -399,7 +410,7 @@ fn cli_refresh_codex_token() {
         .stderr(std::process::Stdio::piped());
 
     let started = Instant::now();
-    let output = match run_with_timeout(&mut cmd, Duration::from_secs(30)) {
+    let output = match run_with_timeout(&mut cmd, Duration::from_secs(60)) {
         Some(output) => output,
         None => {
             diagnose::log(format!(
