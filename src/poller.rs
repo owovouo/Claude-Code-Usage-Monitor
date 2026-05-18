@@ -370,7 +370,10 @@ fn cli_refresh_codex_token() {
         "attempting Windows Codex token refresh via {codex_path}"
     ));
 
-    let args: &[&str] = &["exec", "."];
+    // `--skip-git-repo-check` is required when running outside a trusted git
+    // repo — otherwise the CLI refuses with "Not inside a trusted directory".
+    // Our subprocess inherits this app's cwd, which is rarely a git repo.
+    let args: &[&str] = &["exec", "--skip-git-repo-check", "."];
 
     let mut cmd = if is_cmd {
         let mut c = Command::new("cmd.exe");
