@@ -26,6 +26,11 @@ fn main() {
         }
     }
 
+    if args.iter().any(|arg| arg == "--force-codex-trigger") {
+        poller::arm_force_codex_trigger();
+        diagnose::log("--force-codex-trigger armed: next Codex poll will bypass all gates");
+    }
+
     if let Some(exit_code) = updater::handle_cli_mode(&args) {
         if diagnose_enabled {
             diagnose::log(format!("cli mode exited with code {exit_code}"));

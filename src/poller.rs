@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +18,18 @@ use crate::models::{AppUsageData, UsageData, UsageSection};
 /// observed `reset_at`, so we can detect sliding behavior across polls.
 static CODEX_PREVIOUS_RESET_AT: Mutex<Option<SystemTime>> = Mutex::new(None);
 static CODEX_LAST_TRIGGER_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Debug-only: when armed (via `--force-codex-trigger`), the next `poll_codex`
+/// fires `codex exec .` unconditionally — bypassing the user toggle, Idle
+/// Hours, the empty/sliding-window check, and the cooldown. Consumed on first
+/// poll so subsequent polls behave normally.
+static FORCE_CODEX_TRIGGER: AtomicBool = AtomicBool::new(false);
+
+/// Arm a one-shot forced Codex trigger on the next poll. Called from `main.rs`
+/// when `--force-codex-trigger` is passed on the command line.
+pub fn arm_force_codex_trigger() {
+    FORCE_CODEX_TRIGGER.store(true, Ordering::SeqCst);
+}
 
 /// Treat `reset_at` advancing by more than this between polls as evidence the
 /// window is sliding (or has just rolled over). Both cases warrant a re-lock.
@@ -186,7 +199,10 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
     //                                         window with no usage yet
     //   3. `reset_at` advanced > tolerance  → cross-poll evidence of sliding
     //                                         even with non-zero percentage
-    if allow_trigger {
+    //
+    // `--force-codex-trigger` (debug) bypasses every gate above for one poll.
+    let force = FORCE_CODEX_TRIGGER.swap(false, Ordering::SeqCst);
+    if allow_trigger || force {
         let previous = *CODEX_PREVIOUS_RESET_AT.lock().unwrap();
         let current = data.session.resets_at;
 
@@ -205,9 +221,11 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
             .map(|t| t.elapsed() > CODEX_TRIGGER_COOLDOWN)
             .unwrap_or(true);
 
-        if (no_real_window || is_sliding) && cooldown_passed {
+        let should_trigger = force || ((no_real_window || is_sliding) && cooldown_passed);
+
+        if should_trigger {
             diagnose::log(format!(
-                "Codex window not locked (no_window={no_real_window} sliding={is_sliding} pct={:.2} prev={previous:?} curr={current:?}); running `codex exec .`",
+                "Codex trigger (force={force} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?}); running `codex exec .`",
                 data.session.percentage
             ));
             *CODEX_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
