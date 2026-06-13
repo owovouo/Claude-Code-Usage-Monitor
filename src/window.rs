@@ -678,7 +678,7 @@ fn show_quiet_hours_dialog(
             base_label_style, colon_x, row1_y + sc(2), colon, row_h, 0);
 
         let start_m_edit = make_ctrl!(WS_EX_CLIENTEDGE, "EDIT", "",
-            base_edit_style, m_x, row1_y, m_w, row_h, IDC_QUIET_END_EDIT);
+            base_edit_style, m_x, row1_y, m_w, row_h, 0);
         SendMessageW(start_m_edit, 0x00C5u32, WPARAM(2), LPARAM(0));
 
         // ---- End time ----
@@ -686,7 +686,7 @@ fn show_quiet_hours_dialog(
             base_label_style, pad, row2_y + sc(2), lbl_w, row_h, 0);
 
         let end_h_edit = make_ctrl!(WS_EX_CLIENTEDGE, "EDIT", "",
-            base_edit_style, h_x, row2_y, h_w, row_h, 0);
+            base_edit_style, h_x, row2_y, h_w, row_h, IDC_QUIET_END_EDIT);
         SendMessageW(end_h_edit, 0x00C5u32, WPARAM(2), LPARAM(0));
 
         make_ctrl!(WINDOW_EX_STYLE(0), "STATIC", ":",
@@ -1032,13 +1032,25 @@ fn update_language_change() -> bool {
     true
 }
 
+/// Fork build sub-version, appended after the upstream `CARGO_PKG_VERSION`
+/// (e.g. "1.4.1.2") so our private builds are distinguishable from the
+/// official release and from each other across machines. Bump on each build.
+/// Kept out of `Cargo.toml` on purpose so the updater keeps comparing against
+/// the clean upstream version.
+const FORK_SUBVERSION: &str = "1";
+
+/// Version string shown in the tray menu: upstream version + fork sub-version.
+fn display_version() -> String {
+    format!("{}.{}", env!("CARGO_PKG_VERSION"), FORK_SUBVERSION)
+}
+
 fn version_action_label(
     strings: Strings,
     language: LanguageId,
     install_channel: InstallChannel,
     status: &UpdateStatus,
 ) -> String {
-    let current = env!("CARGO_PKG_VERSION");
+    let current = display_version();
     match status {
         UpdateStatus::Idle => format!("v{current} - {}", strings.check_for_updates),
         UpdateStatus::Checking => format!("v{current} - {}", strings.checking_for_updates),
@@ -1337,7 +1349,9 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+// Widened from 62 to fit the "Xh Ym" countdown format (was just "Xh") —
+// e.g. "36% • 2時45分" / "1% • 4時16分" need ~85 px at 96 DPI.
+const TEXT_WIDTH: i32 = 88;
 const MODEL_RIGHT_MARGIN: i32 = 5;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
@@ -1636,6 +1650,14 @@ pub fn run() {
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
         schedule_quiet_boundary_timer(hwnd);
+
+        // NOTE: we deliberately do NOT arm a forced Codex lock for the initial
+        // poll. cli_refresh_codex_token() blocks the poll thread for 30-120s
+        // while the subprocess runs, so if the very first poll triggered the
+        // lock, the UI would show nothing at all during that window (looks
+        // like the app crashed). Instead we let the natural sliding-detect
+        // path fire the lock on the 2nd poll (~60s after startup), by which
+        // time the display already shows real data.
 
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
@@ -2625,15 +2647,29 @@ unsafe extern "system" fn wnd_proc(
                     // TIMER_POLL so subsequent polls land at boundary + N min
                     // intervals instead of the original schedule.
                     if !is_quiet_time() {
-                        let interval_ms = {
+                        let (interval_ms, lock_codex) = {
                             let state = lock_state();
                             state
                                 .as_ref()
-                                .map(|s| s.poll_interval_ms)
-                                .unwrap_or(POLL_15_MIN)
+                                .map(|s| (s.poll_interval_ms, s.lock_codex_window))
+                                .unwrap_or((POLL_15_MIN, false))
                         };
                         let _ = KillTimer(hwnd, TIMER_POLL);
                         SetTimer(hwnd, TIMER_POLL, interval_ms, None);
+                        // Force a Codex re-lock at the idle-exit boundary. The
+                        // natural sliding-detect path is unreliable here: the
+                        // boundary timer can fire a few ms before the wall-clock
+                        // minute (causing quiet_now() to still return true), the
+                        // pre-idle cooldown can carry over, or the lock from
+                        // before idle may have left an anchor that looks valid
+                        // even though it just expired. Forcing one trigger here
+                        // guarantees a fresh lock at the start of the new day.
+                        if lock_codex {
+                            poller::arm_force_codex_trigger();
+                            diagnose::log(
+                                "idle-exit poll: forcing Codex lock (toggle on)",
+                            );
+                        }
                         let sh = SendHwnd::from_hwnd(hwnd);
                         std::thread::spawn(move || {
                             do_poll(sh);

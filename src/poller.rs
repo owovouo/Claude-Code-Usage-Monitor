@@ -19,25 +19,46 @@ use crate::models::{AppUsageData, UsageData, UsageSection};
 static CODEX_PREVIOUS_RESET_AT: Mutex<Option<SystemTime>> = Mutex::new(None);
 static CODEX_LAST_TRIGGER_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Debug-only: when armed (via `--force-codex-trigger`), the next `poll_codex`
-/// fires `codex exec .` unconditionally — bypassing the user toggle, Idle
-/// Hours, the empty/sliding-window check, and the cooldown. Consumed on first
-/// poll so subsequent polls behave normally.
+/// When armed, the next `poll_codex` fires the Codex lock subprocess
+/// unconditionally — bypassing the user toggle, Idle Hours, the
+/// empty/sliding-window check, and the cooldown. Consumed on first poll so
+/// subsequent polls behave normally.
+///
+/// Armed in two situations:
+///   1. `--force-codex-trigger` CLI flag (debug / manual testing)
+///   2. Exiting Idle Hours (so the lock runs immediately at the boundary,
+///      without relying on the sliding-detect path which can miss-fire if
+///      the boundary timer fires slightly before the wall-clock minute)
+///
+/// NOT armed on app startup, because the lock subprocess blocks the poll
+/// thread for 30-120s and would leave the UI blank during that window. The
+/// natural sliding-detect path fires the lock on the 2nd poll instead.
+///
+/// The caller in (2) must check `lock_codex_window` itself before arming —
+/// this flag bypasses the user toggle.
 static FORCE_CODEX_TRIGGER: AtomicBool = AtomicBool::new(false);
 
-/// Arm a one-shot forced Codex trigger on the next poll. Called from `main.rs`
-/// when `--force-codex-trigger` is passed on the command line.
+/// Arm a one-shot forced Codex trigger on the next poll.
 pub fn arm_force_codex_trigger() {
     FORCE_CODEX_TRIGGER.store(true, Ordering::SeqCst);
 }
 
 /// Treat `reset_at` advancing by more than this between polls as evidence the
 /// window is sliding (or has just rolled over). Both cases warrant a re-lock.
-const CODEX_SLIDING_TOLERANCE: Duration = Duration::from_secs(60);
+/// Kept small so 1-minute polls still detect sliding (where consecutive
+/// reset_at values drift by ~60s with `now`). A locked window has drift = 0,
+/// so 10s comfortably distinguishes the two while tolerating clock jitter.
+const CODEX_SLIDING_TOLERANCE: Duration = Duration::from_secs(10);
 
 /// Minimum time between two Codex triggers. Slightly less than the 5h window
 /// length so a fresh trigger can fire shortly after each natural rollover.
 const CODEX_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
+
+/// A Codex 5h window counts as "anchored" once its `reset_at` is at most this
+/// far in the future. A sliding (un-anchored) or just-rolled window always
+/// reports `reset_at` ≈ now + 5h, so anything below the full window length is
+/// a fixed, anchored reset that needs no (re-)lock. 5h − 60s grace = 17940s.
+const CODEX_ANCHORED_MAX_REMAINING: Duration = Duration::from_secs(5 * 3600 - 60);
 
 static CLAUDE_CODE_LAST_TRIGGER_AT: Mutex<Option<Instant>> = Mutex::new(None);
 const CLAUDE_CODE_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
@@ -154,8 +175,9 @@ fn poll_claude_code(allow_trigger: bool) -> Result<UsageData, PollError> {
 
         if no_real_window && cooldown_passed {
             diagnose::log(format!(
-                "Claude Code window empty (no_window={}); locking via API call",
-                data.session.resets_at.is_none()
+                "Claude Code window needs lock (no_resets_at={} pct={:.2}); locking via API call",
+                data.session.resets_at.is_none(),
+                data.session.percentage
             ));
             *CLAUDE_CODE_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
             if let Ok(locked) = fetch_usage_via_messages(&creds.access_token) {
@@ -176,13 +198,15 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
         }
     };
 
-    let mut data = match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
+    let data = match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
         Ok(data) => data,
         Err(PollError::AuthRequired) => {
+            // Token expired — refresh it. The subprocess may incidentally
+            // lock the 5h window as a side effect, but we do NOT set the
+            // cooldown here: whether or not it anchored will be detected by
+            // the normal sliding-check on subsequent polls, which will fire
+            // the trigger path (with 3-minute anchor verification) if needed.
             cli_refresh_codex_token();
-            // The refresh subprocess (`codex exec .`) also locks a fresh 5h
-            // window, so record it as a trigger for cooldown purposes.
-            *CODEX_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
             let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
             fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())?
         }
@@ -215,29 +239,91 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
             _ => false,
         };
 
+        // A window whose `reset_at` is already a fixed point under 5h away is
+        // anchored — there is nothing to lock. This suppresses an otherwise
+        // wasteful re-lock when another machine on the same account locked the
+        // window before we exited Idle Hours: without it, the idle-exit `force`
+        // re-lock would spend a full ~9k-token subprocess every day for no
+        // effect. A `None` reset_at (no window at all) is not anchored and must
+        // still trigger.
+        let already_anchored = current
+            .and_then(|t| t.duration_since(SystemTime::now()).ok())
+            .map(|remaining| remaining <= CODEX_ANCHORED_MAX_REMAINING)
+            .unwrap_or(false);
+
         let cooldown_passed = CODEX_LAST_TRIGGER_AT
             .lock()
             .unwrap()
             .map(|t| t.elapsed() > CODEX_TRIGGER_COOLDOWN)
             .unwrap_or(true);
 
-        let should_trigger = force || ((no_real_window || is_sliding) && cooldown_passed);
+        let should_trigger =
+            !already_anchored && (force || ((no_real_window || is_sliding) && cooldown_passed));
+
+        diagnose::log(format!(
+            "Codex poll decision: should_trigger={should_trigger} (force={force} anchored={already_anchored} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?})",
+            data.session.percentage
+        ));
 
         if should_trigger {
             diagnose::log(format!(
-                "Codex trigger (force={force} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?}); running `codex exec .`",
+                "Codex trigger (force={force} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?}); running Codex lock subprocess",
                 data.session.percentage
             ));
             *CODEX_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
-            cli_refresh_codex_token();
-            // Re-read credentials after the lock call in case the subprocess
-            // refreshed the auth token; fall back to the original if unavailable.
-            let lock_creds = read_codex_credentials().unwrap_or(creds);
-            data = fetch_codex_usage(&lock_creds.access_token, lock_creds.account_id.as_deref())?;
-            diagnose::log(format!(
-                "Codex post-trigger usage: pct={:.2} resets_at={:?}",
-                data.session.percentage, data.session.resets_at
-            ));
+            // Run the lock subprocess in a background thread so the poll
+            // returns immediately and the UI stays responsive. The cooldown
+            // is already set above, so subsequent polls won't re-trigger.
+            // The next regular poll will observe the anchored reset_at.
+            std::thread::spawn(|| {
+                cli_refresh_codex_token();
+
+                // Wait 3 minutes, then verify the lock actually anchored the
+                // window. A sliding window always has reset_at ≈ now+5h
+                // (remaining > 17940s after 60s grace). An anchored window
+                // has a fixed reset_at that decreases with real time, so
+                // after 3 minutes remaining is at most 17820s.
+                //
+                // If still sliding: reset the cooldown so the next regular
+                // poll can retry immediately, rather than waiting 4 hours.
+                std::thread::sleep(Duration::from_secs(180));
+
+                match read_codex_credentials()
+                    .ok_or(PollError::NoCredentials)
+                    .and_then(|c| {
+                        fetch_codex_usage(&c.access_token, c.account_id.as_deref())
+                    })
+                {
+                    Ok(data) => {
+                        let still_sliding = data
+                            .session
+                            .resets_at
+                            .and_then(|t| t.duration_since(SystemTime::now()).ok())
+                            .map(|remaining| remaining > CODEX_ANCHORED_MAX_REMAINING)
+                            .unwrap_or(true);
+
+                        diagnose::log(format!(
+                            "Codex anchor verify (3m): pct={:.2} resets_at={:?} still_sliding={still_sliding}",
+                            data.session.percentage, data.session.resets_at
+                        ));
+
+                        if still_sliding {
+                            // Lock subprocess didn't anchor the window.
+                            // Reset the cooldown so the next poll retries.
+                            *CODEX_LAST_TRIGGER_AT.lock().unwrap() = None;
+                            diagnose::log(
+                                "Codex lock didn't anchor; cooldown reset, will retry on next poll",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        diagnose::log(format!(
+                            "Codex anchor verify failed (3m): {e:?}; resetting cooldown for retry"
+                        ));
+                        *CODEX_LAST_TRIGGER_AT.lock().unwrap() = None;
+                    }
+                }
+            });
         }
     }
 
@@ -370,17 +456,22 @@ fn cli_refresh_codex_token() {
         "attempting Windows Codex token refresh via {codex_path}"
     ));
 
-    // Locking the Codex 5h window requires hitting the rate-limited chat
-    // endpoint — `codex login status` is too lightweight. We run a tightly
-    // bounded model task: read-only sandbox (no shell), no user config or
-    // rule files loaded, no session persistence, minimal "ok" prompt.
-    // Cost: ~10-30 tokens per lock. Runtime: typically 3-15s.
+    // Locking the Codex 5h window requires the API to attribute the call to
+    // a real session. Previous attempts with --ephemeral / --ignore-* flags
+    // burned only ~2.5k tokens and never anchored anything — likely below
+    // whatever noise threshold the API uses. GitHub openai/codex#19996
+    // reports normal CLI startup alone consumes 21-43k tokens (loading user
+    // config, AGENTS.md, rules, etc.). We now let all of that load so the
+    // call registers as a real Codex session.
+    //
+    // Cost: ~25-50k tokens per lock. Runtime: 30-60s.
+    //
+    // Flags:
+    //   --skip-git-repo-check : bypass git-trust requirement
+    //   -s read-only          : sandbox, no shell execution (still mandatory)
     let args: &[&str] = &[
         "exec",
         "--skip-git-repo-check",
-        "--ephemeral",
-        "--ignore-user-config",
-        "--ignore-rules",
         "-s",
         "read-only",
         "ok",
@@ -409,12 +500,18 @@ fn cli_refresh_codex_token() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    // 180s gives the subprocess room to fully complete (session init + "ok"
+    // response is typically 30-90s without --ephemeral). Hitting the timeout
+    // is not a failure per se: empirically the API call that anchors the 5h
+    // window registers within the first few seconds, so the lock can still
+    // succeed even if we kill the process mid-stream.
     let started = Instant::now();
-    let output = match run_with_timeout(&mut cmd, Duration::from_secs(60)) {
+    let output = match run_with_timeout(&mut cmd, Duration::from_secs(180)) {
         Some(output) => output,
         None => {
             diagnose::log(format!(
-                "codex exec . timed out or failed to spawn after {:?}",
+                "codex lock subprocess exceeded 180s and was killed after {:?} \
+                 (window may still have anchored — check post-trigger reset_at)",
                 started.elapsed()
             ));
             return;
@@ -424,7 +521,7 @@ fn cli_refresh_codex_token() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     diagnose::log(format!(
-        "codex exec . finished: status={:?} after {:?}\n--- stdout ({} bytes) ---\n{}\n--- stderr ({} bytes) ---\n{}\n--- end ---",
+        "codex lock subprocess finished: status={:?} after {:?}\n--- stdout ({} bytes) ---\n{}\n--- stderr ({} bytes) ---\n{}\n--- end ---",
         output.status.code(),
         started.elapsed(),
         output.stdout.len(),
@@ -1225,7 +1322,11 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
     if total_days >= 1 {
         format!("{total_days}{}", strings.day_suffix)
     } else if total_hours >= 1 {
-        format!("{total_hours}{}", strings.hour_suffix)
+        let remaining_mins = (total_secs % 3600) / 60;
+        format!(
+            "{total_hours}{}{remaining_mins}{}",
+            strings.hour_suffix, strings.minute_suffix
+        )
     } else if total_mins >= 1 {
         format!("{total_mins}{}", strings.minute_suffix)
     } else {
