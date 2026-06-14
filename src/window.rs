@@ -137,6 +137,8 @@ const IDM_LANG_GERMAN: u16 = 45;
 const IDM_LANG_JAPANESE: u16 = 46;
 const IDM_LANG_KOREAN: u16 = 47;
 const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
+const IDM_LANG_RUSSIAN: u16 = 49;
+const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 
@@ -3046,7 +3048,9 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_LANG_GERMAN
                 | IDM_LANG_JAPANESE
                 | IDM_LANG_KOREAN
-                | IDM_LANG_TRADITIONAL_CHINESE => {
+                | IDM_LANG_TRADITIONAL_CHINESE
+                | IDM_LANG_RUSSIAN
+                | IDM_LANG_PORTUGUESE_BRAZIL => {
                     let language_override = match id {
                         IDM_LANG_SYSTEM => None,
                         IDM_LANG_ENGLISH => Some(LanguageId::English),
@@ -3057,6 +3061,8 @@ unsafe extern "system" fn wnd_proc(
                         IDM_LANG_JAPANESE => Some(LanguageId::Japanese),
                         IDM_LANG_KOREAN => Some(LanguageId::Korean),
                         IDM_LANG_TRADITIONAL_CHINESE => Some(LanguageId::TraditionalChinese),
+                        IDM_LANG_RUSSIAN => Some(LanguageId::Russian),
+                        IDM_LANG_PORTUGUESE_BRAZIL => Some(LanguageId::PortugueseBrazil),
                         _ => None,
                     };
                     {
@@ -3470,6 +3476,8 @@ fn show_context_menu(hwnd: HWND) {
                 LanguageId::Japanese => IDM_LANG_JAPANESE,
                 LanguageId::Korean => IDM_LANG_KOREAN,
                 LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
+                LanguageId::Russian => IDM_LANG_RUSSIAN,
+                LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
             };
             let label_str = native_interop::wide_str(lang.native_name());
             let flags = if language_override == Some(lang) {
