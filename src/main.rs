@@ -12,7 +12,11 @@ mod window;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
+    // TEMP (2026-06-14): force diagnose on while investigating the Claude vs
+    // Codex reset-time / quiet-hours mismatch, so both machines log without
+    // needing the flag. Revert to
+    // `args.iter().any(|arg| arg == "--diagnose")` once resolved.
+    let diagnose_enabled = true;
     if diagnose_enabled {
         match diagnose::init() {
             Ok(path) => diagnose::log(format!(

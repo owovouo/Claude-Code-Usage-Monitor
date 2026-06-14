@@ -173,6 +173,14 @@ fn poll_claude_code(allow_trigger: bool) -> Result<UsageData, PollError> {
             .map(|t| t.elapsed() > CLAUDE_CODE_TRIGGER_COOLDOWN)
             .unwrap_or(true);
 
+        diagnose::log(format!(
+            "Claude Code poll decision: should_lock={} (no_resets_at={} pct={:.2} cooldown_passed={cooldown_passed} resets_at={:?})",
+            no_real_window && cooldown_passed,
+            data.session.resets_at.is_none(),
+            data.session.percentage,
+            data.session.resets_at
+        ));
+
         if no_real_window && cooldown_passed {
             diagnose::log(format!(
                 "Claude Code window needs lock (no_resets_at={} pct={:.2}); locking via API call",
