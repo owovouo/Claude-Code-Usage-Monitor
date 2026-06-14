@@ -60,6 +60,14 @@ const CODEX_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
 /// a fixed, anchored reset that needs no (re-)lock. 5h − 60s grace = 17940s.
 const CODEX_ANCHORED_MAX_REMAINING: Duration = Duration::from_secs(5 * 3600 - 60);
 
+/// `reset_at` of the most recently confirmed anchored window. The Codex
+/// `/wham/usage` endpoint intermittently reports a sliding `reset_at` (≈ now+5h)
+/// on scattered polls even while the window is actually anchored and idle, so a
+/// single sliding reading cannot be trusted. We remember the last anchored
+/// reading and treat the window as anchored until that time passes, ignoring
+/// transient sliding flip-flops in between.
+static CODEX_ANCHORED_UNTIL: Mutex<Option<SystemTime>> = Mutex::new(None);
+
 static CLAUDE_CODE_LAST_TRIGGER_AT: Mutex<Option<Instant>> = Mutex::new(None);
 const CLAUDE_CODE_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
 
@@ -197,6 +205,17 @@ fn poll_claude_code(allow_trigger: bool) -> Result<UsageData, PollError> {
     Ok(data)
 }
 
+/// Records `reset_at` as the anchored window if it is a fixed point under the
+/// full 5h away (i.e. not a sliding ≈ now+5h reading). Sliding readings are
+/// ignored so a transient flip-flop can't overwrite a known good anchor.
+fn note_codex_anchor(reset_at: Option<SystemTime>) {
+    if let Some(remaining) = reset_at.and_then(|t| t.duration_since(SystemTime::now()).ok()) {
+        if remaining <= CODEX_ANCHORED_MAX_REMAINING {
+            *CODEX_ANCHORED_UNTIL.lock().unwrap() = reset_at;
+        }
+    }
+}
+
 fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
     let creds = match read_codex_credentials() {
         Some(creds) => creds,
@@ -221,18 +240,27 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
         Err(error) => return Err(error),
     };
 
-    // Decide whether to lock a window. Three trigger conditions, gated by cooldown
-    // (so a stuck/failed trigger can't loop) and the caller's `allow_trigger`
-    // (which is false during Idle Hours).
+    // Record an anchored reading (if this poll shows one) before deciding
+    // whether to lock, so the trigger logic can ignore later sliding flip-flops.
+    note_codex_anchor(data.session.resets_at);
+
+    // Decide whether to lock a window. Trigger conditions (all gated by the
+    // cooldown so a stuck/failed trigger can't loop, and by the caller's
+    // `allow_trigger`, which is false during Idle Hours):
     //
     //   1. `resets_at` is None              → API reports no window at all
-    //   2. `percentage <= 0.0`              → window present but empty; likely
-    //                                         a sliding fake or a just-rolled
-    //                                         window with no usage yet
+    //   2. `percentage <= 0.0`              → window present but empty
     //   3. `reset_at` advanced > tolerance  → cross-poll evidence of sliding
-    //                                         even with non-zero percentage
     //
-    // `--force-codex-trigger` (debug) bypasses every gate above for one poll.
+    // All of these are suppressed while the last confirmed anchored window is
+    // still in the future (`window_still_anchored`). The Codex endpoint
+    // intermittently reports a sliding `reset_at` (≈ now+5h) on scattered polls
+    // even on an anchored, idle window, so reacting to a single sliding reading
+    // would fire a useless lock — and that lock's cooldown would then block the
+    // real re-lock when the window genuinely expires.
+    //
+    // `--force-codex-trigger` (debug) and the idle-exit force still respect the
+    // anchored guard — there is no point re-locking an already-anchored window.
     let force = FORCE_CODEX_TRIGGER.swap(false, Ordering::SeqCst);
     if allow_trigger || force {
         let previous = *CODEX_PREVIOUS_RESET_AT.lock().unwrap();
@@ -247,16 +275,14 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
             _ => false,
         };
 
-        // A window whose `reset_at` is already a fixed point under 5h away is
-        // anchored — there is nothing to lock. This suppresses an otherwise
-        // wasteful re-lock when another machine on the same account locked the
-        // window before we exited Idle Hours: without it, the idle-exit `force`
-        // re-lock would spend a full ~9k-token subprocess every day for no
-        // effect. A `None` reset_at (no window at all) is not anchored and must
-        // still trigger.
-        let already_anchored = current
-            .and_then(|t| t.duration_since(SystemTime::now()).ok())
-            .map(|remaining| remaining <= CODEX_ANCHORED_MAX_REMAINING)
+        // Trust the remembered anchor over the current single reading: while the
+        // last anchored reset is still in the future the window is anchored and
+        // needs no lock, regardless of transient sliding flip-flops. Once it
+        // passes (or was never set), triggering is allowed again.
+        let window_still_anchored = CODEX_ANCHORED_UNTIL
+            .lock()
+            .unwrap()
+            .map(|t| t > SystemTime::now())
             .unwrap_or(false);
 
         let cooldown_passed = CODEX_LAST_TRIGGER_AT
@@ -265,11 +291,11 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
             .map(|t| t.elapsed() > CODEX_TRIGGER_COOLDOWN)
             .unwrap_or(true);
 
-        let should_trigger =
-            !already_anchored && (force || ((no_real_window || is_sliding) && cooldown_passed));
+        let should_trigger = !window_still_anchored
+            && (force || ((no_real_window || is_sliding) && cooldown_passed));
 
         diagnose::log(format!(
-            "Codex poll decision: should_trigger={should_trigger} (force={force} anchored={already_anchored} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?})",
+            "Codex poll decision: should_trigger={should_trigger} (force={force} anchored={window_still_anchored} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?})",
             data.session.percentage
         ));
 
@@ -322,6 +348,10 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
                             diagnose::log(
                                 "Codex lock didn't anchor; cooldown reset, will retry on next poll",
                             );
+                        } else {
+                            // Anchor confirmed — remember it so later sliding
+                            // flip-flop readings don't re-trigger a lock.
+                            note_codex_anchor(data.session.resets_at);
                         }
                     }
                     Err(e) => {

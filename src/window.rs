@@ -1037,7 +1037,7 @@ fn update_language_change() -> bool {
 /// official release and from each other across machines. Bump on each build.
 /// Kept out of `Cargo.toml` on purpose so the updater keeps comparing against
 /// the clean upstream version.
-const FORK_SUBVERSION: &str = "1";
+const FORK_SUBVERSION: &str = "2";
 
 /// Version string shown in the tray menu: upstream version + fork sub-version.
 fn display_version() -> String {
