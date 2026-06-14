@@ -2919,7 +2919,7 @@ unsafe extern "system" fn wnd_proc(
             let id = wparam.0 as u16;
             match id {
                 1 => {
-                    {
+                    let lock_codex = {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.session_text = "...".to_string();
@@ -2927,7 +2927,19 @@ unsafe extern "system" fn wnd_proc(
                             s.codex_session_text = "...".to_string();
                             s.codex_weekly_text = "...".to_string();
                             s.force_notify_auth_error = true;
+                            s.lock_codex_window
+                        } else {
+                            false
                         }
+                    };
+                    // Manual refresh forces a Codex re-lock on demand so the user
+                    // can re-anchor a stuck/sliding 5h window immediately, bypassing
+                    // the cooldown and the two-poll sliding detection. Gated by the
+                    // user's lock toggle; still skipped if the window is already
+                    // anchored (re-locking can't move an active window earlier).
+                    if lock_codex {
+                        poller::arm_force_codex_trigger();
+                        diagnose::log("manual refresh: forcing Codex lock (toggle on)");
                     }
                     render_layered();
                     let sh = SendHwnd::from_hwnd(hwnd);
