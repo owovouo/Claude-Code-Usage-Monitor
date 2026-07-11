@@ -360,6 +360,17 @@ fn note_codex_anchor(reset_at: Option<SystemTime>) {
     }
 }
 
+fn should_trigger_codex(
+    force: bool,
+    window_still_anchored: bool,
+    no_real_window: bool,
+    is_sliding: bool,
+    cooldown_passed: bool,
+) -> bool {
+    (no_real_window || !window_still_anchored)
+        && (force || ((no_real_window || is_sliding) && cooldown_passed))
+}
+
 fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
     let creds = match read_codex_credentials() {
         Some(creds) => creds,
@@ -393,7 +404,7 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
     // `allow_trigger`, which is false during Idle Hours):
     //
     //   1. `resets_at` is None              → API reports no window at all
-    //   2. `percentage <= 0.0`              → window present but empty
+    //   2. `percentage <= 1.0`              → window present but empty
     //   3. `reset_at` advanced > tolerance  → cross-poll evidence of sliding
     //
     // All of these are suppressed while the last confirmed anchored window is
@@ -410,7 +421,8 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
         let previous = *CODEX_PREVIOUS_RESET_AT.lock().unwrap();
         let current = data.session.resets_at;
 
-        let no_real_window = current.is_none() || data.session.percentage <= 0.0;
+        // The unified ChatGPT/Codex usage endpoint reports an unused window as 1%.
+        let no_real_window = current.is_none() || data.session.percentage <= 1.0;
         let is_sliding = match (previous, current) {
             (Some(prev), Some(curr)) => curr
                 .duration_since(prev)
@@ -435,8 +447,13 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
             .map(|t| t.elapsed() > CODEX_TRIGGER_COOLDOWN)
             .unwrap_or(true);
 
-        let should_trigger = !window_still_anchored
-            && (force || ((no_real_window || is_sliding) && cooldown_passed));
+        let should_trigger = should_trigger_codex(
+            force,
+            window_still_anchored,
+            no_real_window,
+            is_sliding,
+            cooldown_passed,
+        );
 
         diagnose::log(format!(
             "Codex poll decision: should_trigger={should_trigger} (force={force} anchored={window_still_anchored} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?})",
@@ -1913,6 +1930,12 @@ mod tests {
             },
             weekly: UsageSection::default(),
         }
+    }
+
+    #[test]
+    fn empty_codex_window_overrides_stale_anchor() {
+        assert!(should_trigger_codex(false, true, true, true, true));
+        assert!(!should_trigger_codex(false, true, false, true, true));
     }
 
     #[test]
