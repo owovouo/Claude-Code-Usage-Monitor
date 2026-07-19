@@ -12,10 +12,7 @@ mod window;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // TEMP (2026-06-15): force diagnose on to capture Codex's post-restart
-    // re-anchor behavior (why its reset jumped from 13:03 to ~16:37). Revert to
-    // `args.iter().any(|arg| arg == "--diagnose")` once resolved.
-    let diagnose_enabled = true;
+    let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     if diagnose_enabled {
         match diagnose::init() {
             Ok(path) => diagnose::log(format!("startup args={args:?} log_path={}", path.display())),
