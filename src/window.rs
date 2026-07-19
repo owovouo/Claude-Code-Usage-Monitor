@@ -935,15 +935,32 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                 });
             }
             if s.show_codex {
+                let codex_has_no_five_hour_window = s.codex_session_resets_at.is_none()
+                    && s.codex_weekly_resets_at.is_some();
+                let (percent, tooltip) = if codex_has_no_five_hour_window {
+                    (
+                        s.codex_weekly_percent,
+                        format!(
+                            "{} 7d: {}",
+                            s.language.strings().codex_model,
+                            s.codex_weekly_text
+                        ),
+                    )
+                } else {
+                    (
+                        s.codex_session_percent,
+                        format!(
+                            "{} 5h: {} | 7d: {}",
+                            s.language.strings().codex_model,
+                            s.codex_session_text,
+                            s.codex_weekly_text
+                        ),
+                    )
+                };
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(s.codex_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().codex_model,
-                        s.codex_session_text,
-                        s.codex_weekly_text
-                    ),
+                    percent: Some(percent),
+                    tooltip,
                 });
             }
             if s.show_antigravity {

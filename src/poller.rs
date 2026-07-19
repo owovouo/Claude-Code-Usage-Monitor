@@ -15,11 +15,9 @@ use crate::diagnose;
 use crate::localization::Strings;
 use crate::models::{AppUsageData, UsageData, UsageSection};
 
-/// Codex's `/wham/usage` endpoint returns a "sliding" window — `reset_at` is
-/// always ~5h from now — until the user makes an actual API call. To give the
-/// user a fixed, plannable reset time, we run `codex exec .` once to lock the
-/// 5h window. These statics track when we last locked and the previously
-/// observed `reset_at`, so we can detect sliding behavior across polls.
+/// Codex's `/wham/usage` endpoint returns a sliding `reset_at` until the user
+/// makes an actual API call. We run `codex exec .` once to lock the active
+/// limit window and remember the previously observed reset across polls.
 static CODEX_PREVIOUS_RESET_AT: Mutex<Option<SystemTime>> = Mutex::new(None);
 static CODEX_LAST_TRIGGER_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -63,6 +61,8 @@ const CODEX_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
 /// reports `reset_at` ≈ now + 5h, so anything below the full window length is
 /// a fixed, anchored reset that needs no (re-)lock. 5h − 60s grace = 17940s.
 const CODEX_ANCHORED_MAX_REMAINING: Duration = Duration::from_secs(5 * 3600 - 60);
+const CODEX_WEEKLY_ANCHORED_MAX_REMAINING: Duration =
+    Duration::from_secs(7 * 24 * 3600 - 60);
 
 /// `reset_at` of the most recently confirmed anchored window. The Codex
 /// `/wham/usage` endpoint intermittently reports a sliding `reset_at` (≈ now+5h)
@@ -71,6 +71,7 @@ const CODEX_ANCHORED_MAX_REMAINING: Duration = Duration::from_secs(5 * 3600 - 60
 /// reading and treat the window as anchored until that time passes, ignoring
 /// transient sliding flip-flops in between.
 static CODEX_ANCHORED_UNTIL: Mutex<Option<SystemTime>> = Mutex::new(None);
+static CODEX_WEEKLY_ANCHORED_UNTIL: Mutex<Option<SystemTime>> = Mutex::new(None);
 
 static CLAUDE_CODE_LAST_TRIGGER_AT: Mutex<Option<Instant>> = Mutex::new(None);
 const CLAUDE_CODE_TRIGGER_COOLDOWN: Duration = Duration::from_secs(4 * 3600);
@@ -142,6 +143,7 @@ struct CodexRateLimitDetails {
 #[derive(Deserialize)]
 struct CodexRateLimitWindow {
     used_percent: f64,
+    limit_window_seconds: Option<i64>,
     reset_at: i64,
 }
 
@@ -349,13 +351,33 @@ fn poll_claude_code(allow_trigger: bool) -> Result<UsageData, PollError> {
     Ok(data)
 }
 
-/// Records `reset_at` as the anchored window if it is a fixed point under the
-/// full 5h away (i.e. not a sliding ≈ now+5h reading). Sliding readings are
-/// ignored so a transient flip-flop can't overwrite a known good anchor.
-fn note_codex_anchor(reset_at: Option<SystemTime>) {
+fn codex_active_window(
+    data: &UsageData,
+    five_hour_limit_unavailable: bool,
+) -> (&UsageSection, Duration) {
+    if five_hour_limit_unavailable {
+        (&data.weekly, CODEX_WEEKLY_ANCHORED_MAX_REMAINING)
+    } else {
+        (&data.session, CODEX_ANCHORED_MAX_REMAINING)
+    }
+}
+
+fn codex_reset_is_sliding(reset_at: Option<SystemTime>, max_remaining: Duration) -> bool {
+    reset_at
+        .and_then(|t| t.duration_since(SystemTime::now()).ok())
+        .map(|remaining| remaining > max_remaining)
+        .unwrap_or(true)
+}
+
+/// Records a fixed reset while ignoring sliding readings near the full window.
+fn note_codex_anchor(
+    reset_at: Option<SystemTime>,
+    max_remaining: Duration,
+    anchored_until: &Mutex<Option<SystemTime>>,
+) {
     if let Some(remaining) = reset_at.and_then(|t| t.duration_since(SystemTime::now()).ok()) {
-        if remaining <= CODEX_ANCHORED_MAX_REMAINING {
-            *CODEX_ANCHORED_UNTIL.lock().unwrap() = reset_at;
+        if remaining <= max_remaining {
+            *anchored_until.lock().unwrap() = reset_at;
         }
     }
 }
@@ -380,32 +402,43 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
         }
     };
 
-    let data = match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
-        Ok(data) => data,
-        Err(PollError::AuthRequired) => {
-            // Token expired — refresh it. The subprocess may incidentally
-            // lock the 5h window as a side effect, but we do NOT set the
-            // cooldown here: whether or not it anchored will be detected by
-            // the normal sliding-check on subsequent polls, which will fire
-            // the trigger path (with 3-minute anchor verification) if needed.
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())?
-        }
-        Err(error) => return Err(error),
+    let (data, five_hour_limit_unavailable) =
+        match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
+            Ok(result) => result,
+            Err(PollError::AuthRequired) => {
+                // Token expired — refresh it. The subprocess may incidentally
+                // lock the 5h window as a side effect, but we do NOT set the
+                // cooldown here: whether or not it anchored will be detected by
+                // the normal sliding-check on subsequent polls, which will fire
+                // the trigger path (with 3-minute anchor verification) if needed.
+                cli_refresh_codex_token();
+                let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
+                fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())?
+            }
+            Err(error) => return Err(error),
+        };
+
+    let (window, max_remaining) =
+        codex_active_window(&data, five_hour_limit_unavailable);
+    let anchored_until = if five_hour_limit_unavailable {
+        &CODEX_WEEKLY_ANCHORED_UNTIL
+    } else {
+        &CODEX_ANCHORED_UNTIL
     };
+    let current = window.resets_at;
 
     // Record an anchored reading (if this poll shows one) before deciding
     // whether to lock, so the trigger logic can ignore later sliding flip-flops.
-    note_codex_anchor(data.session.resets_at);
+    note_codex_anchor(current, max_remaining, anchored_until);
 
     // Decide whether to lock a window. Trigger conditions (all gated by the
     // cooldown so a stuck/failed trigger can't loop, and by the caller's
     // `allow_trigger`, which is false during Idle Hours):
     //
-    //   1. `resets_at` is None              → API reports no window at all
-    //   2. `percentage <= 1.0`              → window present but empty
-    //   3. `reset_at` advanced > tolerance  → cross-poll evidence of sliding
+    //   1. `resets_at` is None               → API reports no window at all
+    //   2. 5h `percentage <= 1.0`            → session window is empty
+    //   3. `reset_at` advanced > tolerance   → cross-poll evidence of sliding
+    //   4. weekly reset is still nearly +7d  → weekly window is not anchored
     //
     // All of these are suppressed while the last confirmed anchored window is
     // still in the future (`window_still_anchored`). The Codex endpoint
@@ -419,23 +452,27 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
     let force = FORCE_CODEX_TRIGGER.swap(false, Ordering::SeqCst);
     if allow_trigger || force {
         let previous = *CODEX_PREVIOUS_RESET_AT.lock().unwrap();
-        let current = data.session.resets_at;
 
-        // The unified ChatGPT/Codex usage endpoint reports an unused window as 1%.
-        let no_real_window = current.is_none() || data.session.percentage <= 1.0;
-        let is_sliding = match (previous, current) {
-            (Some(prev), Some(curr)) => curr
-                .duration_since(prev)
-                .map(|d| d > CODEX_SLIDING_TOLERANCE)
-                .unwrap_or(false),
-            _ => false,
-        };
+        // The 5h endpoint reports an unused window as 1%. Weekly usage can
+        // remain at 0–1% after a successful lock, so use its moving reset time.
+        let no_real_window = current.is_none()
+            || (!five_hour_limit_unavailable && window.percentage <= 1.0);
+        let near_full_weekly_window = five_hour_limit_unavailable
+            && codex_reset_is_sliding(current, max_remaining);
+        let is_sliding = near_full_weekly_window
+            || match (previous, current) {
+                (Some(prev), Some(curr)) => curr
+                    .duration_since(prev)
+                    .map(|d| d > CODEX_SLIDING_TOLERANCE)
+                    .unwrap_or(false),
+                _ => false,
+            };
 
         // Trust the remembered anchor over the current single reading: while the
         // last anchored reset is still in the future the window is anchored and
         // needs no lock, regardless of transient sliding flip-flops. Once it
         // passes (or was never set), triggering is allowed again.
-        let window_still_anchored = CODEX_ANCHORED_UNTIL
+        let window_still_anchored = anchored_until
             .lock()
             .unwrap()
             .map(|t| t > SystemTime::now())
@@ -456,14 +493,14 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
         );
 
         diagnose::log(format!(
-            "Codex poll decision: should_trigger={should_trigger} (force={force} anchored={window_still_anchored} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?})",
-            data.session.percentage
+            "Codex poll decision: should_trigger={should_trigger} (force={force} five_hour_unavailable={five_hour_limit_unavailable} anchored={window_still_anchored} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?})",
+            window.percentage
         ));
 
         if should_trigger {
             diagnose::log(format!(
                 "Codex trigger (force={force} no_window={no_real_window} sliding={is_sliding} cooldown_passed={cooldown_passed} pct={:.2} prev={previous:?} curr={current:?}); running Codex lock subprocess",
-                data.session.percentage
+                window.percentage
             ));
             *CODEX_LAST_TRIGGER_AT.lock().unwrap() = Some(Instant::now());
             // Run the lock subprocess in a background thread so the poll
@@ -473,11 +510,8 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
             std::thread::spawn(|| {
                 cli_refresh_codex_token();
 
-                // Wait 3 minutes, then verify the lock actually anchored the
-                // window. A sliding window always has reset_at ≈ now+5h
-                // (remaining > 17940s after 60s grace). An anchored window
-                // has a fixed reset_at that decreases with real time, so
-                // after 3 minutes remaining is at most 17820s.
+                // Wait 3 minutes, then verify that the selected 5h or 7d reset
+                // is now fixed rather than still a full window from now.
                 //
                 // If still sliding: reset the cooldown so the next regular
                 // poll can retry immediately, rather than waiting 4 hours.
@@ -489,17 +523,20 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
                         fetch_codex_usage(&c.access_token, c.account_id.as_deref())
                     })
                 {
-                    Ok(data) => {
-                        let still_sliding = data
-                            .session
-                            .resets_at
-                            .and_then(|t| t.duration_since(SystemTime::now()).ok())
-                            .map(|remaining| remaining > CODEX_ANCHORED_MAX_REMAINING)
-                            .unwrap_or(true);
+                    Ok((data, five_hour_limit_unavailable)) => {
+                        let (window, max_remaining) =
+                            codex_active_window(&data, five_hour_limit_unavailable);
+                        let anchored_until = if five_hour_limit_unavailable {
+                            &CODEX_WEEKLY_ANCHORED_UNTIL
+                        } else {
+                            &CODEX_ANCHORED_UNTIL
+                        };
+                        let still_sliding =
+                            codex_reset_is_sliding(window.resets_at, max_remaining);
 
                         diagnose::log(format!(
-                            "Codex anchor verify (3m): pct={:.2} resets_at={:?} still_sliding={still_sliding}",
-                            data.session.percentage, data.session.resets_at
+                            "Codex anchor verify (3m): five_hour_unavailable={five_hour_limit_unavailable} pct={:.2} resets_at={:?} still_sliding={still_sliding}",
+                            window.percentage, window.resets_at
                         ));
 
                         if still_sliding {
@@ -512,7 +549,11 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
                         } else {
                             // Anchor confirmed — remember it so later sliding
                             // flip-flop readings don't re-trigger a lock.
-                            note_codex_anchor(data.session.resets_at);
+                            note_codex_anchor(
+                                window.resets_at,
+                                max_remaining,
+                                anchored_until,
+                            );
                         }
                     }
                     Err(e) => {
@@ -528,7 +569,7 @@ fn poll_codex(allow_trigger: bool) -> Result<UsageData, PollError> {
 
     // Always record the reset_at we just observed so the next poll can detect
     // sliding behavior.
-    *CODEX_PREVIOUS_RESET_AT.lock().unwrap() = data.session.resets_at;
+    *CODEX_PREVIOUS_RESET_AT.lock().unwrap() = current;
 
     Ok(data)
 }
@@ -1105,7 +1146,10 @@ fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     data
 }
 
-fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
+fn fetch_codex_usage(
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<(UsageData, bool), PollError> {
     let agent = build_agent()?;
     let mut request = agent
         .get(CODEX_USAGE_URL)
@@ -1143,26 +1187,31 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
 
 /// Parse a `/wham/usage` response into our internal `UsageData` shape.
 ///
-/// Returns an empty `UsageData` (0%, no `resets_at`) when the response has no
-/// `rate_limit` or `primary_window` — i.e. there's no active 5h window. This
-/// is distinct from a network/parse error so the caller can react accordingly
-/// (e.g. attempt a one-shot `codex exec .` to start a window).
-fn codex_usage_from_response(response: CodexUsageResponse) -> UsageData {
+/// The boolean is true when the API explicitly puts a 7d window in the primary
+/// slot, so polling and lock verification target that window instead of 5h.
+/// A missing primary window keeps the old lock behavior for inactive 5h windows.
+fn codex_usage_from_response(response: CodexUsageResponse) -> (UsageData, bool) {
     let mut data = UsageData::default();
     let Some(details_box) = response.rate_limit.flatten() else {
-        return data;
+        return (data, false);
     };
     let details = *details_box;
+    let mut five_hour_limit_unavailable = false;
 
     if let Some(window) = details.primary_window.flatten() {
-        data.session = codex_section_from_window(&window);
+        if window.limit_window_seconds == Some(7 * 24 * 60 * 60) {
+            five_hour_limit_unavailable = true;
+            data.weekly = codex_section_from_window(&window);
+        } else {
+            data.session = codex_section_from_window(&window);
+        }
     }
 
     if let Some(window) = details.secondary_window.flatten() {
         data.weekly = codex_section_from_window(&window);
     }
 
-    data
+    (data, five_hour_limit_unavailable)
 }
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
@@ -1921,6 +1970,42 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_window_duration_controls_row_and_lock() {
+        let now = SystemTime::now();
+        assert!(codex_reset_is_sliding(
+            Some(now + CODEX_WEEKLY_ANCHORED_MAX_REMAINING + Duration::from_secs(30)),
+            CODEX_WEEKLY_ANCHORED_MAX_REMAINING,
+        ));
+        assert!(!codex_reset_is_sliding(
+            Some(now + CODEX_WEEKLY_ANCHORED_MAX_REMAINING - Duration::from_secs(30)),
+            CODEX_WEEKLY_ANCHORED_MAX_REMAINING,
+        ));
+
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":4,"limit_window_seconds":604800,"reset_at":2000000000},"secondary_window":null}}"#,
+        )
+        .unwrap();
+
+        let (usage, five_hour_limit_unavailable) = codex_usage_from_response(response);
+
+        assert_eq!(usage.session.percentage, 0.0);
+        assert_eq!(usage.weekly.percentage, 4.0);
+        assert!(five_hour_limit_unavailable);
+        assert!(should_trigger_codex(false, false, false, true, true));
+        assert!(!should_trigger_codex(false, true, false, true, true));
+
+        let restored: CodexUsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_at":2000000000},"secondary_window":null}}"#,
+        )
+        .unwrap();
+        let (usage, five_hour_limit_unavailable) = codex_usage_from_response(restored);
+
+        assert_eq!(usage.session.percentage, 1.0);
+        assert!(!five_hour_limit_unavailable);
+        assert!(should_trigger_codex(false, false, true, false, true));
+    }
 
     fn usage_with_session_percent(percentage: f64) -> UsageData {
         UsageData {
